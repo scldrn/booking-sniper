@@ -1,71 +1,114 @@
-# LCN Auto-Book System
+# LCN Auto-Book
 
-An automated, serverless booking system designed to autonomously schedule and manage classes on the LCN Idiomas platform. This system bypasses the limitations of the official web interface's recommendation engine to provide precise, real-time class booking.
+Servicio personal que vigila el tablero de LCN Idiomas y reserva clases de inglés que coinciden con las preferencias del estudiante. La ejecución productiva ocurre en una Edge Function de Supabase, activada por `pg_cron` cada minuto de lunes a sábado.
 
----
+## Estado actual
 
-## System Architecture
+El perfil activo está configurado para **B1**. El motor acepta una clase cuyo grupo contenga el código CEFR `B1` (`B1`, `A2-B1`, `B1-B2`, etc.) y rechaza niveles diferentes o ausentes. El nivel se lee de `student_config.target_level`; durante la migración también se reconoce temporalmente el nombre antiguo `level_group_name`.
 
-The entire system operates 100% serverless on Supabase, ensuring high availability without the need for local scripts or background processes on a personal computer.
+## Arquitectura
 
-The architecture consists of three main components:
-1. **Database (Supabase PostgreSQL):** 
-    - `student_config`: Stores scheduling preferences (allowed hour ranges, permitted days, target headquarters, and course level).
-    - `booking_logs`: Functions as the system's memory and operational log. It records successful bookings and learns from rejections to prevent API spam.
-2. **Execution Engine (Edge Function - TypeScript):** A cloud-hosted function (`auto-book/index.ts`) that contains the core logic for filtering available classes, authenticating via Laravel Sanctum, and executing asynchronous booking requests.
-3. **Scheduler (pg_cron):** A background PostgreSQL process that invokes the Edge Function exactly every minute on weekdays (`* * * * 1-5`), ensuring constant vigilance over the platform's schedule board.
+```text
+pg_cron
+  -> Edge Function auto-book
+      -> valida secreto del disparador
+      -> adquiere lock distribuido
+      -> carga y valida preferencias
+      -> autentica en LCN con Sanctum
+      -> consulta el tablero de 3 fechas
+      -> filtra y ordena clases B1 elegibles
+      -> reserva de forma secuencial
+      -> registra resultado sin guardar credenciales
+```
 
----
+La función conserva el burst de apertura: consulta inmediatamente y vuelve a consultar a los 10, 20, 30, 40 y 50 segundos solo si todavía no logró una reserva. También hace el intento de `+1 minuto`, backoff y patrullas en horas/medias horas.
 
-## Technical Insights & Reverse Engineering
+## Estructura
 
-During the development of this system, several insights regarding the LCN backend were discovered and accounted for:
+```text
+database/
+  schema.sql
+  migrations/20260826_harden_and_move_to_b1.sql
+  schedule.sql
+supabase/
+  config.toml
+  functions/auto-book/
+    index.ts          # Entrada y orquestación
+    config.ts         # Validación de entorno y configuración
+    domain.js         # Fechas, niveles, filtros y respuestas; código puro
+    domain.d.ts       # Tipos de la lógica JavaScript para Deno/TypeScript
+    lcnClient.ts      # Login Sanctum, cookies, timeout y endpoints LCN
+    repository.ts     # Supabase, logs y lock distribuido
+    types.ts
+tests/unit/           # Pruebas deterministas sin red ni reservas
+tests/                # Diagnósticos manuales, separados de las pruebas
+research/             # Evidencia histórica de reverse engineering
+scripts/audit-secrets.mjs
+```
 
-* **Sanctum API Authentication:** The platform utilizes modern Laravel Sanctum authentication relying on CSRF Tokens and Cookies. To book a class, the system sequentially requests a CSRF cookie and authenticates to retrieve the necessary session headers.
-* **Direct Schedule Access:** The official web interface's recommendation endpoint (`/suggest-class-schedule`) often obscures available classes. This system bypasses it entirely by fetching the raw, unfiltered calendar directly from `/api/schedules/between-dates`.
-* **Ghost Classes Handling:** The backend occasionally publishes empty classes (0/6 capacity) that have not yet been assigned a teacher. Attempting to book these results in an internal rejection (`"No se encontró un profesor disponible. 3"`). The system logs this failure but continuously monitors the class, instantly securing the booking the moment an administrator assigns a teacher.
+## Despliegue seguro
 
----
+Las credenciales y tokens deben existir únicamente como secretos del entorno. El repositorio ya no debe contener cookies, JWT, contraseñas ni tokens de Supabase.
 
-## Core Logic & Operations
+1. Revoca/rota inmediatamente las cookies LCN, la contraseña de LCN y cualquier JWT que haya estado en versiones anteriores del repositorio. Eliminar un literal del último commit no lo elimina del historial de Git.
+2. En una base nueva ejecuta `database/schema.sql` y crea tu fila de preferencias usando `database/student-config.example.sql` como guía. En una base existente ejecuta `database/migrations/20260826_harden_and_move_to_b1.sql`; esa migración elimina las columnas de cookies obsoletas y cambia las preferencias antiguas a B1.
+3. Configura los secretos de la Edge Function (por ejemplo, con Supabase CLI):
 
-### 1. Rolling Time Window
-The system perpetually scans a 3-day window: the current day, tomorrow, and the day after tomorrow. This window advances automatically at midnight.
+   ```bash
+   supabase secrets set \
+     LCN_EMAIL="tu-correo" \
+     LCN_PASSWORD="tu-contraseña" \
+     AUTO_BOOK_ENABLED="false" \
+     AUTO_BOOK_TRIGGER_SECRET="un-secreto-largo-y-aleatorio" \
+     LCN_REQUEST_TIMEOUT_MS="8000" \
+     AUTO_BOOK_LOCK_TTL_SECONDS="180"
+   ```
 
-### 2. Resource Management & Rate Limiting
-To prevent account restrictions and avoid unnecessary API loads, the system avoids authenticating every single minute. It calculates the current time and executes full logic only during strategic moments:
-- **Exact Opening Minutes:** 09:00, 10:30, 12:00, 13:30.
-- **Immediate Follow-up:** +1 minute.
-- **Backoff Sweeps:** +2, +3, +5, +10, and +20 minutes post-opening.
-- **Routine Patrols:** Every hour and half-hour mark.
-Executions outside these specific times are silently skipped before authentication occurs.
+   `SUPABASE_URL` y `SUPABASE_SERVICE_ROLE_KEY` deben estar disponibles en el entorno de la función. Nunca expongas la service-role key al navegador ni a `pg_cron`.
 
-### 3. Asynchronous Burst Mode
-At the exact moment of class releases (e.g., 09:00:00), the system enters Burst Mode. It dispatches asynchronous requests at 0s, 10s, 20s, 30s, 40s, and 50s. If multiple targeted classes are available across the 3-day window, the system handles booking them simultaneously in parallel.
+4. Despliega la función:
 
-### 4. Dynamic Blacklisting (`ALREADY_BOOKED`)
-When the system attempts to book a class that the user has already manually reserved, the API responds indicating a schedule conflict. The system captures the class ID and stores it in the database with an `ALREADY_BOOKED` status. From that moment on, the system entirely ignores that class, focusing its computational power strictly on securing the remaining unbooked slots.
+   ```bash
+   supabase functions deploy auto-book
+   ```
 
----
+5. Abre `database/schedule.sql`, reemplaza localmente sus tres placeholders (`SUPABASE_PROJECT_REF`, `SUPABASE_ANON_KEY` y `AUTO_BOOK_TRIGGER_SECRET`) y ejecútalo en el SQL Editor. No guardes el archivo reemplazado.
 
-## Repository Structure
+6. Verifica que `student_config` tenga la sede, días y rango horario deseados. Los valores habituales del proyecto siguen siendo lunes-viernes y 09:00–12:00; el motor no inventa preferencias. Para bloquear una franja cancelada manualmente usa, por ejemplo, `[{"date":"2026-09-01","startHour":450}]` en `blocked_slots`.
 
-The codebase is organized into a modular standard:
+La reserva está desactivada por defecto mediante `AUTO_BOOK_ENABLED=false`. La función responde en modo `dry_run` y no autentica contra LCN mientras ese valor no sea `true`. Cuando quieras activar el agendamiento, cambia únicamente ese secreto a `true`; antes de hacerlo confirma la configuración y prueba primero el flujo de solo lectura.
 
-* **`/database`**: Core SQL files.
-    * `schema.sql`: Table definitions and schema structure.
-    * `setup_definitivo_lcn.sql`: Deployment script to initialize the cron job and configure the student's radar parameters.
-* **`/supabase/functions/auto-book`**: Contains the live TypeScript Edge Function (`index.ts`).
-* **`/tests`**: Local Node.js scripts developed during engineering to validate algorithms, monitor real-time board states, and debug logic constraints.
-* **`/scripts-investigacion`**: Initial Python and JS scraping scripts utilized for the reverse engineering of LCN's headers and session states.
-* **`/lcn-scheduler`**: Legacy local version operated via PM2/Terminal, preserved for redundancy.
+Si la versión anterior todavía tiene un cron activo, ejecuta `database/pause-scheduler.sql` para detenerlo durante esta etapa. Ese archivo solo pausa; no programa nada.
 
----
-
-## Deployment
-
-To push changes or updates to the Edge Function, utilize the Supabase CLI:
+## Pruebas y mantenimiento
 
 ```bash
-supabase functions deploy auto-book --project-ref <your-project-ref>
+npm test
+npm run check
 ```
+
+Las pruebas automáticas no hacen login ni reservan. El único diagnóstico manual de `tests/` es de solo lectura y recibe sus valores desde variables de entorno.
+
+Para inspeccionar logs, usa la tabla `booking_logs`. Los detalles se redactan antes de insertarse y cada ejecución tiene un `request_id`. El lock de `booking_locks` evita que dos minutos consecutivos hagan reservas simultáneamente; si no se puede adquirir o liberar correctamente, se registra el incidente.
+
+## Fortalezas
+
+- Ventana móvil de tres fechas, adecuada para aperturas con 48 horas de anticipación.
+- Filtro de sede, tipo, horario, día, cupos, nivel, anticipación mínima y bloqueos manuales.
+- Orden cronológico y deduplicación por ID antes de reservar.
+- Autenticación renovada por ejecución con CSRF y cookies de sesión.
+- Timeouts, respuestas JSON tolerantes y logs sanitizados.
+- Pruebas puras para las reglas más sensibles: zona horaria, aperturas, B1 y elegibilidad.
+
+## Riesgos que se corrigieron
+
+- Fechas construidas con `toISOString()` podían cambiar de día según la zona horaria del servidor. Ahora se calculan con `America/Bogota` explícitamente.
+- Las horas de sábado podían activar el motor cualquier día. Ahora se distinguen lunes-viernes, sábado y domingo.
+- El filtro anterior usaba `includes`, por lo que podía aceptar coincidencias textuales imprecisas. Ahora compara códigos CEFR completos.
+- Había un firewall de fechas de junio de 2026 incrustado en código. Ahora los bloqueos son datos configurables en `blocked_slots`.
+- El cron y el esquema contenían secretos y cookies. Ahora usan placeholders/secretos del entorno.
+- El proceso no tenía bloqueo distribuido, timeout ni validación de capacidad/configuración. Esos controles están en el motor y el esquema.
+
+## Nota de responsabilidad
+
+Este servicio actúa sobre una cuenta personal y contra endpoints de una plataforma de terceros. Respeta los términos de LCN, sus límites de uso y las reglas de cancelación; una reserva automática no debe usarse para acaparar cupos ni para operar cuentas ajenas.

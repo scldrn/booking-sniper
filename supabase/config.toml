@@ -1,0 +1,2 @@
+[functions.auto-book]
+verify_jwt = true

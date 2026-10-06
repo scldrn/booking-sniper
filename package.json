@@ -1,11 +1,13 @@
 {
   "name": "lcn-auto-book-sniper",
   "version": "1.0.0",
-  "description": "Automated booking sniper for LCN language platform",
+  "description": "Automated class booking service for the LCN language platform",
   "type": "module",
-  "dependencies": {
-    "@supabase/supabase-js": "^2.39.0",
-    "dotenv": "^16.4.0",
-    "puppeteer": "^25.1.0"
-  }
+  "private": true,
+  "scripts": {
+    "test": "node --test tests/unit/*.test.js",
+    "audit:secrets": "node scripts/audit-secrets.mjs",
+    "check": "npm run audit:secrets && npm test"
+  },
+  "dependencies": {}
 }

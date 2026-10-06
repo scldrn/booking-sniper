@@ -1,5 +1,10 @@
 node_modules/
 .env
+.env.*
+!.env.example
 supabase/.env.local
 supabase/.temp/
 .lcn_api_guide.md
+.DS_Store
+*.log
+database/*.local.sql
